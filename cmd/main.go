@@ -1,21 +1,28 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 
-	"github.com/Cryezidl/url-shortener.git/handlers"
-	"github.com/Cryezidl/url-shortener.git/storage"
+	"github.com/Cryezidl/url-shortener/cfg"
+	"github.com/Cryezidl/url-shortener/handlers"
+	"github.com/Cryezidl/url-shortener/storage"
 	"github.com/go-chi/chi/v5"
 )
 
 func main() {
-	dataStorage := storage.NewStorage()
+	config := cfg.LoadConfig()
+	dataStorage, err := storage.NewStorage(config.DBPath)
+	if err != nil {
+		panic(fmt.Errorf("failed to initialize storage: %w", err))
+	}
+
 	logger := slog.Default()
 	redirectHandler := handlers.NewRedirecHandler(dataStorage, logger)
 	apiHandler := handlers.NewAPIHandler(dataStorage, logger)
 
-	//Настроиваем роуты
+	//Setup router
 	router := chi.NewRouter()
 
 	router.Route("/api", func(r chi.Router) {
@@ -29,5 +36,7 @@ func main() {
 
 	router.Get("/{shortname}", redirectHandler.Redirect)
 
-	http.ListenAndServe(":8080", router)
+	if err := http.ListenAndServe(":"+config.Port, router); err != nil {
+		logger.Error("failed to start server", "error", err)
+	}
 }
