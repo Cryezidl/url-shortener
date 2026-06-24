@@ -2,16 +2,35 @@ package storage
 
 import (
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// newTestStorage spins up a fresh in-memory sqlite storage for each test.
+// ":memory:" keeps tests fast while still exercising real SQL.
+func newTestStorage(t *testing.T) (*Storage, *slog.Logger) {
+	t.Helper()
+	s, err := NewStorage(":memory:")
+	require.NoError(t, err, "storage should initialize")
+	t.Cleanup(func() { _ = s.db.Close() })
+	return s, slog.Default()
+}
+
+func TestNewStorage(t *testing.T) {
+	s, err := NewStorage(":memory:")
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	assert.NoError(t, s.db.Ping())
+	_ = s.db.Close()
+}
 
 func TestStorage_AddRule(t *testing.T) {
 	tests := []struct {
-		name string
-
+		name      string
 		shortPath string
 		targetURL string
 		ttl       time.Duration
@@ -31,48 +50,53 @@ func TestStorage_AddRule(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := NewStorage()
-			l := slog.Default()
+			s, l := newTestStorage(t)
 			s.AddRule(tt.shortPath, tt.targetURL, tt.ttl, l)
-			rule := s.GetRule(tt.shortPath, l)
 
-			assert.NotNil(t, rule, "Rule should be created")
+			rule := s.GetRule(tt.shortPath, l)
+			require.NotNil(t, rule, "rule should be created")
 			assert.Equal(t, tt.targetURL, rule.TargetURL)
 			assert.NotZero(t, rule.CreatedAt)
+
+			if tt.ttl > 0 {
+				assert.NotNil(t, rule.ExpiresAt, "temporary rule should have ExpiresAt")
+			} else {
+				assert.Nil(t, rule.ExpiresAt, "permanent rule should not have ExpiresAt")
+			}
 		})
 	}
 }
 
+func TestStorage_AddRule_Upsert(t *testing.T) {
+	s, l := newTestStorage(t)
+
+	s.AddRule("/dup", "https://old.com", 0, l)
+	s.AddRule("/dup", "https://new.com", 0, l) // same short path -> should update, not error
+
+	rule := s.GetRule("/dup", l)
+	require.NotNil(t, rule)
+	assert.Equal(t, "https://new.com", rule.TargetURL, "target should be updated on conflict")
+}
+
 func TestStorage_DeleteRule(t *testing.T) {
-	tests := []struct {
-		name string
+	s, l := newTestStorage(t)
 
-		shortPath string
-		targetURL string
-	}{
-		{
-			name:      "Deleting test",
-			shortPath: "/google",
-			targetURL: "https://google.com",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := NewStorage()
-			l := slog.Default()
+	s.AddRule("/google", "https://google.com", 0, l)
+	s.DeleteRule("/google", l)
 
-			s.AddRule(tt.shortPath, tt.targetURL, 0, l)
-			s.DeleteRule(tt.shortPath, l)
-			rule := s.GetRule(tt.shortPath, l)
-			assert.Nil(t, rule, "Rule should be deleted")
-		})
-	}
+	rule := s.GetRule("/google", l)
+	assert.Nil(t, rule, "rule should be deleted")
+}
+
+func TestStorage_DeleteRule_NonExistent(t *testing.T) {
+	s, l := newTestStorage(t)
+	// deleting a missing rule should be a no-op, not a panic
+	assert.NotPanics(t, func() { s.DeleteRule("/nope", l) })
 }
 
 func TestStorage_GetRule(t *testing.T) {
 	tests := []struct {
-		name string
-
+		name      string
 		shortPath string
 		targetURL string
 		wantFind  string
@@ -96,17 +120,15 @@ func TestStorage_GetRule(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := NewStorage()
-			l := slog.Default()
+			s, l := newTestStorage(t)
 			s.AddRule(tt.shortPath, tt.targetURL, 0, l)
 
 			rule := s.GetRule(tt.wantFind, l)
 			if tt.wantNil {
-				assert.Nil(t, rule, "Rule should be nil")
-			} else {
-				assert.NotNil(t, rule, "Rule should be created")
+				assert.Nil(t, rule, "rule should be nil")
+				return
 			}
-
+			require.NotNil(t, rule, "rule should be found")
 			assert.Equal(t, tt.targetURL, rule.TargetURL)
 			assert.NotZero(t, rule.CreatedAt)
 		})
@@ -150,24 +172,21 @@ func TestStorage_GetStats(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := NewStorage()
-			l := slog.Default()
+			s, l := newTestStorage(t)
 			s.AddRule(tt.shortPath, tt.targetURL, 0, l)
 
-			// Добавляем хиты если нужно
 			for i := 0; i < tt.hitsCount; i++ {
 				s.IncrementStats(tt.shortPath, l)
 			}
 
 			stats := s.GetStats(tt.wantFind, l)
-
 			if tt.wantNil {
-				assert.Nil(t, stats, "Stats should be nil")
+				assert.Nil(t, stats, "stats should be nil")
 				return
 			}
 
-			assert.NotNil(t, stats, "Stats should exist")
-			assert.Equal(t, int64(tt.hitsCount), stats.Hits, "Hits count mismatch")
+			require.NotNil(t, stats, "stats should exist")
+			assert.Equal(t, int64(tt.hitsCount), stats.Hits, "hits count mismatch")
 
 			if tt.hitsCount > 0 {
 				assert.NotZero(t, stats.LastAccessed, "LastAccessed should be set")
@@ -183,7 +202,6 @@ func TestStorage_IncrementStats(t *testing.T) {
 		targetURL      string
 		incrementFor   string
 		incrementCount int
-		wantPanic      bool
 	}{
 		{
 			name:           "Increment stats for existing rule",
@@ -191,15 +209,13 @@ func TestStorage_IncrementStats(t *testing.T) {
 			targetURL:      "https://google.com",
 			incrementFor:   "/google",
 			incrementCount: 3,
-			wantPanic:      false,
 		},
 		{
-			name:           "Increment stats for non-existent rule (should not panic)",
+			name:           "Increment stats for non-existent rule (no-op, no panic)",
 			shortPath:      "/google",
 			targetURL:      "https://google.com",
 			incrementFor:   "/nonexistent",
 			incrementCount: 1,
-			wantPanic:      false,
 		},
 		{
 			name:           "Increment stats multiple times",
@@ -207,34 +223,23 @@ func TestStorage_IncrementStats(t *testing.T) {
 			targetURL:      "https://github.com",
 			incrementFor:   "/github",
 			incrementCount: 10,
-			wantPanic:      false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := NewStorage()
-			l := slog.Default()
+			s, l := newTestStorage(t)
 			s.AddRule(tt.shortPath, tt.targetURL, 0, l)
 
-			// Проверяем что нет паники
-			defer func() {
-				if r := recover(); r != nil {
-					if !tt.wantPanic {
-						t.Errorf("IncrementStats panicked: %v", r)
-					}
+			assert.NotPanics(t, func() {
+				for i := 0; i < tt.incrementCount; i++ {
+					s.IncrementStats(tt.incrementFor, l)
 				}
-			}()
+			})
 
-			// Инкрементируем статистику
-			for i := 0; i < tt.incrementCount; i++ {
-				s.IncrementStats(tt.incrementFor, l)
-			}
-
-			// Проверяем результат только для существующего правила
 			if tt.incrementFor == tt.shortPath {
 				stats := s.GetStats(tt.shortPath, l)
-				assert.NotNil(t, stats)
+				require.NotNil(t, stats)
 				assert.Equal(t, int64(tt.incrementCount), stats.Hits)
 				assert.NotZero(t, stats.LastAccessed)
 			}
@@ -292,15 +297,9 @@ func TestStorage_RuleExpired(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := NewStorage()
-			l := slog.Default()
+			s, l := newTestStorage(t)
+			s.AddRule(tt.shortPath, tt.targetURL, tt.ttl, l)
 
-			// Добавляем правило только если указан путь
-			if tt.shortPath != "" {
-				s.AddRule(tt.shortPath, tt.targetURL, tt.ttl, l)
-			}
-
-			// Ждем если нужно
 			if tt.sleep > 0 {
 				time.Sleep(tt.sleep)
 			}
@@ -309,4 +308,32 @@ func TestStorage_RuleExpired(t *testing.T) {
 			assert.Equal(t, tt.want, expired, "RuleExpired result mismatch")
 		})
 	}
+}
+
+// TestStorage_Persistence is the key advantage over the old in-memory map:
+// data survives reopening the same database file.
+func TestStorage_Persistence(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "persist_test.db")
+	l := slog.Default()
+
+	// First session: write a rule and rack up some hits.
+	s1, err := NewStorage(dbPath)
+	require.NoError(t, err)
+	s1.AddRule("/persist", "https://persist.com", 0, l)
+	s1.IncrementStats("/persist", l)
+	s1.IncrementStats("/persist", l)
+	require.NoError(t, s1.db.Close())
+
+	// Second session: reopen the same file, data should still be there.
+	s2, err := NewStorage(dbPath)
+	require.NoError(t, err)
+	defer s2.db.Close()
+
+	rule := s2.GetRule("/persist", l)
+	require.NotNil(t, rule, "rule should survive a restart")
+	assert.Equal(t, "https://persist.com", rule.TargetURL)
+
+	stats := s2.GetStats("/persist", l)
+	require.NotNil(t, stats)
+	assert.Equal(t, int64(2), stats.Hits, "hits should survive a restart")
 }
