@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Cryezidl/url-shortener.git/pkg"
-	"github.com/Cryezidl/url-shortener.git/storage"
+	"github.com/Cryezidl/url-shortener/pkg"
+	"github.com/Cryezidl/url-shortener/storage"
 )
 
 type RedirectHandler struct {
@@ -34,6 +34,6 @@ func (h *RedirectHandler) Redirect(w http.ResponseWriter, r *http.Request) {
 		pkg.RespondWithError(w, http.StatusNotFound, "rule was expired", h.logger)
 		return
 	}
-
+	h.dataStorage.IncrementStats(shortPath, h.logger)
 	http.Redirect(w, r, rule.TargetURL, http.StatusFound)
 }

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Cryezidl/url-shortener.git/pkg"
-	"github.com/Cryezidl/url-shortener.git/storage"
+	"github.com/Cryezidl/url-shortener/pkg"
+	"github.com/Cryezidl/url-shortener/storage"
 	"github.com/go-chi/chi/v5"
 )
 
